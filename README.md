@@ -1,6 +1,6 @@
 Adds CUDA graph compilation, flash attention and kv-caching to speed-up [MolmoBot](https://github.com/allenai/MolmoBot) inference. 
 
-On 1 H100 this leads to 4.5x speedup. When using 10 -> 5 flow steps and assuming generous cache hits, this leads to 11x speedup.
+On 1 H100 this leads to a 7.5x speedup. When using 10 -> 5 flow steps and assuming generous cache hits, this leads to 18x speedup.
 
 ## setup
 
@@ -71,6 +71,17 @@ Finally, when we run a profiler, we can see the bottleneck is in the 500M DiT mo
 | CPU Preprocess | 4.3 ms | 6% |
 | AE Context Build | 2.2 ms | 3% |
 | H2D + D2H transfers | 0.1 ms | ~0% |
+
+## molmospaces evaluation
+
+The above benchmark is random data. This uses simulation data from MolmoSpaces.
+
+```bash
+bash setup_sim_eval.sh # setup
+
+# full 200-episode pick-and-place eval (~4 min/episode, ~13 hours total)
+bash run_sim_eval.sh
+```
 
 ## api
 
