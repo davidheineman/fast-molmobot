@@ -1,4 +1,4 @@
-Adds CUDA graph compilation, flash attention and kv-caching to speed-up MolmoBot inference. 
+Adds CUDA graph compilation, flash attention and kv-caching to speed-up [MolmoBot](https://github.com/allenai/MolmoBot) inference. 
 
 On 1 H100 this leads to 4.5x speedup. When using 10 -> 5 flow steps and assuming generous cache hits, this leads to 11x speedup.
 
@@ -6,8 +6,8 @@ On 1 H100 this leads to 4.5x speedup. When using 10 -> 5 flow steps and assuming
 
 ```bash
 # clone this repo
-git clone git@github.com:davidheineman/molmobot.git
-cd molmobot
+git clone git@github.com:davidheineman/fast-molmobot.git
+cd fast-molmobot
 
 # clone + install MolmoBot
 git clone git@github.com:allenai/MolmoBot.git
@@ -61,6 +61,16 @@ Why don't we see 50x speedups like vLLM vs. HF? This is because we aren't batchi
 The next two biggest jumps would come from: (1) training a smaller model (a MolmoBot 1.7B or 0.6B) and using speculating decoding and (2) using flow-matching to perform diffusion in one step.
 
 I tried FP8 inference and TensorRT, but single-batch inference is memory-bandwidth bound, not comput-bound.
+
+Finally, when we run a profiler, we can see the bottleneck is in the 500M DiT model which runs 10 diffusion steps for each chunk of actions:
+
+| Stage | Time | % |
+|---|---|---|
+| AE Flow Loop (x10) | 42.6 ms | 60% |
+| Backbone (ViT+LLM) | 21.5 ms | 30% |
+| CPU Preprocess | 4.3 ms | 6% |
+| AE Context Build | 2.2 ms | 3% |
+| H2D + D2H transfers | 0.1 ms | ~0% |
 
 ## api
 
