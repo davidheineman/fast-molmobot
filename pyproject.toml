@@ -1,0 +1,23 @@
+[build-system]
+requires = ["setuptools", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "molmobot-fast"
+version = "0.1.0"
+description = "Fast MolmoBot"
+readme = "README.md"
+requires-python = "~=3.11.0"
+dependencies = [
+    "molmobot",
+    "flash-attn>=2.5",
+    "numpy",
+    "torch>=2.3",
+    "huggingface_hub",
+]
+
+[project.scripts]
+molmobot-bench = "molmobot_fast.benchmark:main"
+
+[tool.setuptools.packages.find]
+include = ["molmobot_fast*"]
