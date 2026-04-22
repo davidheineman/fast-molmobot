@@ -180,9 +180,11 @@ def _ae_precompute_context(ae, encoder_hidden_states, encoder_attention_mask=Non
 
 def _ae_forward(ae, actions, timesteps, encoder_hidden_states,
                 encoder_attention_mask=None, state_embeddings=None,
-                states_mode="cross_attn", cached_context=None):
+                states_mode="cross_attn", cached_context=None,
+                timestep_embed=None):
     bsz, seq_len, _ = actions.shape
-    timestep_embed = ae.time_embed(timesteps)
+    if timestep_embed is None:
+        timestep_embed = ae.time_embed(timesteps)
     x = ae.action_embed(actions)
 
     if cached_context is not None:
@@ -342,6 +344,7 @@ def _capture_flow_graph(model, trajectory, layer_states, cached_ctx, steps):
             g_mask = cached_ctx.cross_mask.clone() if cached_ctx.cross_mask is not None else None
             g_enc = cached_ctx.encoded_states.clone() if cached_ctx.encoded_states is not None else None
             g_ts = [torch.full((batch_size,), i / steps, device=device) for i in range(steps)]
+            g_tes = [model.action_expert.time_embed(t) for t in g_ts]
             g_cached = ActionExpertCachedContext(
                 tuple(cached_ctx.contexts),
                 g_mask,
@@ -350,8 +353,8 @@ def _capture_flow_graph(model, trajectory, layer_states, cached_ctx, steps):
                 cached_ctx.states_mode,
             )
             step_fn = _safe_compile_callable(
-                lambda traj, t: model.action_expert(
-                    traj, t, layer_states, cached_context=g_cached),
+                lambda traj, te: model.action_expert(
+                    traj, None, layer_states, cached_context=g_cached, timestep_embed=te),
                 "action-expert-step",
                 mode="max-autotune-no-cudagraphs",
                 fullgraph=False,
@@ -361,7 +364,7 @@ def _capture_flow_graph(model, trajectory, layer_states, cached_ctx, steps):
             for _ in range(2):
                 g_traj.copy_(trajectory)
                 for si in range(steps):
-                    vel = step_fn(g_traj, g_ts[si])
+                    vel = step_fn(g_traj, g_tes[si])
                     g_traj.add_(vel, alpha=dt)
             torch.cuda.synchronize()
 
@@ -369,7 +372,7 @@ def _capture_flow_graph(model, trajectory, layer_states, cached_ctx, steps):
             g_traj.copy_(trajectory)
             with torch.cuda.graph(graph, pool=model._cuda_graph_pool):
                 for si in range(steps):
-                    vel = step_fn(g_traj, g_ts[si])
+                    vel = step_fn(g_traj, g_tes[si])
                     g_traj.add_(vel, alpha=dt)
 
             if model._cuda_graph_pool is None:
