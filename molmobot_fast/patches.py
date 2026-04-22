@@ -62,7 +62,7 @@ def _safe_compile_module(module, label: str, **compile_kwargs):
 class ActionExpertCachedContext:
     contexts: Sequence[Optional[torch.Tensor]]
     cross_mask: Optional[torch.Tensor]
-    cached_cross_kvs: Tuple[torch.Tensor, torch.Tensor]
+    cached_cross_kvs: torch.Tensor
     encoded_states: Optional[torch.Tensor]
     states_mode: str
 
@@ -162,10 +162,10 @@ def _make_ae_block_forward(mod):
 
 
 def _stack_cross_kvs(cached_cross_kvs: Sequence[Tuple[torch.Tensor, torch.Tensor]]
-                     ) -> Tuple[torch.Tensor, torch.Tensor]:
+                     ) -> torch.Tensor:
     ks = torch.stack([k for k, _ in cached_cross_kvs], dim=0).contiguous()
     vs = torch.stack([v for _, v in cached_cross_kvs], dim=0).contiguous()
-    return ks, vs
+    return torch.stack((ks, vs), dim=0).contiguous()
 
 
 def _ae_precompute_context(ae, encoder_hidden_states, encoder_attention_mask=None,
@@ -224,12 +224,11 @@ def _ae_forward(ae, actions, timesteps, encoder_hidden_states,
         encoded_states = cached_context.encoded_states
         contexts = cached_context.contexts
         cross_mask = cached_context.cross_mask
-        cached_cross_kvs_k, cached_cross_kvs_v = cached_context.cached_cross_kvs
+        cached_cross_kvs = cached_context.cached_cross_kvs
         states_mode = cached_context.states_mode
     else:
         encoded_states = ae._encode_states(state_embeddings)
-        cached_cross_kvs_k = None
-        cached_cross_kvs_v = None
+        cached_cross_kvs = None
         all_visible = (
             isinstance(encoder_attention_mask, torch.Tensor)
             and encoder_attention_mask.dtype == torch.bool
@@ -254,8 +253,8 @@ def _ae_forward(ae, actions, timesteps, encoder_hidden_states,
     x = x + pos
 
     for i, block in enumerate(ae.blocks):
-        if cached_cross_kvs_k is not None:
-            cross_kv = (cached_cross_kvs_k[i], cached_cross_kvs_v[i])
+        if cached_cross_kvs is not None:
+            cross_kv = (cached_cross_kvs[0, i], cached_cross_kvs[1, i])
             context = None
         else:
             cross_kv = None
@@ -356,7 +355,7 @@ def _enable_cuda_graph(model):
 
 def _run_flow_loop_cudagraph(model, trajectory, layer_states, cached_ctx, steps):
     batch_size = trajectory.shape[0]
-    ctx_seq_len = cached_ctx.cached_cross_kvs[0].shape[3]
+    ctx_seq_len = cached_ctx.cached_cross_kvs.shape[4]
     shape_key = (batch_size, steps, ctx_seq_len)
 
     if model._cuda_graph is None or model._graph_captured_shape != shape_key:
@@ -365,8 +364,7 @@ def _run_flow_loop_cudagraph(model, trajectory, layer_states, cached_ctx, steps)
 
     gv = model._graph_vars
     gv["trajectory"].copy_(trajectory)
-    gv["cross_kvs_k"].copy_(cached_ctx.cached_cross_kvs[0])
-    gv["cross_kvs_v"].copy_(cached_ctx.cached_cross_kvs[1])
+    gv["cross_kvs"].copy_(cached_ctx.cached_cross_kvs)
     if gv.get("cross_mask") is not None and cached_ctx.cross_mask is not None:
         gv["cross_mask"].copy_(cached_ctx.cross_mask)
     if gv.get("encoded_states") is not None and cached_ctx.encoded_states is not None:
@@ -386,15 +384,14 @@ def _capture_flow_graph(model, trajectory, layer_states, cached_ctx, steps):
     ):
         try:
             g_traj = trajectory.clone()
-            g_kvk = cached_ctx.cached_cross_kvs[0].clone()
-            g_kvv = cached_ctx.cached_cross_kvs[1].clone()
+            g_kvs = cached_ctx.cached_cross_kvs.clone()
             g_mask = cached_ctx.cross_mask.clone() if cached_ctx.cross_mask is not None else None
             g_enc = cached_ctx.encoded_states.clone() if cached_ctx.encoded_states is not None else None
             g_ts = [torch.full((batch_size,), i / steps, device=device) for i in range(steps)]
             g_cached = ActionExpertCachedContext(
                 tuple(cached_ctx.contexts),
                 g_mask,
-                (g_kvk, g_kvv),
+                g_kvs,
                 g_enc,
                 cached_ctx.states_mode,
             )
@@ -427,13 +424,12 @@ def _capture_flow_graph(model, trajectory, layer_states, cached_ctx, steps):
             model._graph_vars = {
                 "trajectory": g_traj,
                 "cross_mask": g_mask,
-                "cross_kvs_k": g_kvk,
-                "cross_kvs_v": g_kvv,
+                "cross_kvs": g_kvs,
                 "encoded_states": g_enc,
             }
             log.info(
                 "Captured compiled CUDA graph: steps=%d, ctx_len=%d",
-                steps, g_kvk.shape[3],
+                steps, g_kvs.shape[4],
             )
             return
         except Exception as exc:
@@ -443,12 +439,11 @@ def _capture_flow_graph(model, trajectory, layer_states, cached_ctx, steps):
     g_traj = trajectory.clone()
     g_ctx = list(cached_ctx.contexts)
     g_mask = cached_ctx.cross_mask.clone() if cached_ctx.cross_mask is not None else None
-    g_kvk = cached_ctx.cached_cross_kvs[0].clone()
-    g_kvv = cached_ctx.cached_cross_kvs[1].clone()
+    g_kvs = cached_ctx.cached_cross_kvs.clone()
     g_enc = cached_ctx.encoded_states.clone() if cached_ctx.encoded_states is not None else None
     g_ts = [torch.full((batch_size,), i / steps, device=device) for i in range(steps)]
     g_cached = ActionExpertCachedContext(
-        g_ctx, g_mask, (g_kvk, g_kvv), g_enc, cached_ctx.states_mode)
+        g_ctx, g_mask, g_kvs, g_enc, cached_ctx.states_mode)
     dt = 1.0 / steps
 
     for _ in range(2):
@@ -470,9 +465,9 @@ def _capture_flow_graph(model, trajectory, layer_states, cached_ctx, steps):
     model._cuda_graph = graph
     model._graph_vars = {
         "trajectory": g_traj, "contexts": g_ctx, "cross_mask": g_mask,
-        "cross_kvs_k": g_kvk, "cross_kvs_v": g_kvv, "encoded_states": g_enc,
+        "cross_kvs": g_kvs, "encoded_states": g_enc,
     }
-    log.info(f"Captured eager CUDA graph: steps={steps}, ctx_len={g_kvk.shape[3]}")
+    log.info(f"Captured eager CUDA graph: steps={steps}, ctx_len={g_kvs.shape[4]}")
 
 
 # ═══════════════════════════════════════════════════════════════════════════
