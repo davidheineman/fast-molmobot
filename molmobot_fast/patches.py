@@ -164,27 +164,45 @@ def _make_ae_block_forward(mod):
 def _ae_precompute_context(ae, encoder_hidden_states, encoder_attention_mask=None,
                            state_embeddings=None, states_mode="cross_attn"):
     bsz = encoder_hidden_states[0].shape[0]
+    ctx_dtype = encoder_hidden_states[0].dtype
     encoded_states = ae._encode_states(state_embeddings)
     all_visible = (
         isinstance(encoder_attention_mask, torch.Tensor)
         and encoder_attention_mask.dtype == torch.bool
         and bool(torch.all(encoder_attention_mask))
     )
+    cached_cross_kvs = []
     if states_mode == "self_attn":
-        contexts = ae._prepare_context(encoder_hidden_states, None)
         cross_mask = None if all_visible else ae._build_cross_attention_mask(
-            encoder_attention_mask, None, bsz, contexts[0].dtype
+            encoder_attention_mask, None, bsz, ctx_dtype
         )
+        for blk, hidden in zip(ae.blocks, encoder_hidden_states):
+            ctx = ae.context_norm(ae.context_proj(hidden))
+            cached_cross_kvs.append(blk.precompute_cross_kv(ctx))
+        cached_encoded_states = encoded_states
     else:
-        contexts = ae._prepare_context(encoder_hidden_states, encoded_states)
         cross_mask = None if all_visible else ae._build_cross_attention_mask(
-            encoder_attention_mask, encoded_states, bsz, contexts[0].dtype
+            encoder_attention_mask, encoded_states, bsz, ctx_dtype
         )
-    cached_cross_kvs = [blk.precompute_cross_kv(ctx) for blk, ctx in zip(ae.blocks, contexts)]
+        for blk, hidden in zip(ae.blocks, encoder_hidden_states):
+            ctx = ae.context_norm(ae.context_proj(hidden))
+            if encoded_states is not None:
+                ctx = torch.cat([ctx, encoded_states], dim=1)
+            cached_cross_kvs.append(blk.precompute_cross_kv(ctx))
+        # In cross-attn mode encoded_states are only used to build cross context/mask.
+        # The flow loop consumes precomputed cross K/V tensors directly.
+        cached_encoded_states = None
+
     # Once cross-attn K/V tensors are precomputed, the full context tensors are no longer
     # needed by block.forward; dropping them avoids redundant graph replay copies.
     contexts = tuple(None for _ in cached_cross_kvs)
-    return ActionExpertCachedContext(contexts, cross_mask, cached_cross_kvs, encoded_states, states_mode)
+    return ActionExpertCachedContext(
+        contexts,
+        cross_mask,
+        cached_cross_kvs,
+        cached_encoded_states,
+        states_mode,
+    )
 
 
 def _ae_forward(ae, actions, timesteps, encoder_hidden_states,
