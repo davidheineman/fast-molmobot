@@ -150,19 +150,13 @@ def _make_ae_block_forward(mod):
         shift_mca, scale_mca, gate_mca = shifts_scales[3], shifts_scales[4], shifts_scales[5]
         shift_mlp, scale_mlp, gate_mlp = shifts_scales[6], shifts_scales[7], shifts_scales[8]
 
-        msa = mod.attn1(_compiled_modulate(mod.norm1(x), shift_msa, scale_msa))
-        x.addcmul_(gate_msa.unsqueeze(1), msa)
-
-        mca = mod.attn2(
+        x = x + gate_msa.unsqueeze(1) * mod.attn1(
+            _compiled_modulate(mod.norm1(x), shift_msa, scale_msa))
+        x = x + gate_mca.unsqueeze(1) * mod.attn2(
             _compiled_modulate(mod.norm2(x), shift_mca, scale_mca),
-            kv=cross_context,
-            attn_mask=attn_mask,
-            precomputed_kv=cached_cross_kv,
-        )
-        x.addcmul_(gate_mca.unsqueeze(1), mca)
-
-        mlp = mod.mlp(_compiled_modulate(mod.norm3(x), shift_mlp, scale_mlp))
-        x.addcmul_(gate_mlp.unsqueeze(1), mlp)
+            kv=cross_context, attn_mask=attn_mask, precomputed_kv=cached_cross_kv)
+        x = x + gate_mlp.unsqueeze(1) * mod.mlp(
+            _compiled_modulate(mod.norm3(x), shift_mlp, scale_mlp))
         return x
     return forward
 
