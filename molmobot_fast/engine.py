@@ -1,5 +1,4 @@
 import concurrent.futures
-import hashlib
 import logging
 import time
 from typing import Dict, List, Optional, Union
@@ -205,7 +204,13 @@ class FastMolmoBot:
             example["state"] = state
         processed = self._preprocessor(example)
         batch = self._collator([processed])
-        return self._pin(batch)
+        batch = self._pin(batch)
+        if self._cache_backbone:
+            input_ids = batch.get("input_ids")
+            if isinstance(input_ids, torch.Tensor):
+                # Keep cache-key hashing on CPU tensors to avoid GPU->CPU sync.
+                batch["_backbone_cache_key"] = hash_inputs(input_ids, None)
+        return batch
 
     @staticmethod
     def _pin(batch):
@@ -268,10 +273,11 @@ class FastMolmoBot:
             "input_ids", "attention_mask", "position_ids", "response_mask",
             "images", "image_masks", "token_pooling", "low_res_token_pooling", "states",
         ) if k in batch and batch.get(k) is not None}
+        cache_key = batch.get("_backbone_cache_key") if self._cache_backbone else None
 
         with torch.no_grad(), torch.autocast(device_type="cuda", dtype=torch.bfloat16):
             if self._cache_backbone:
-                actions = self._run_cached(mi)
+                actions = self._run_cached(mi, cache_key=cache_key)
             else:
                 actions = self._model.generate_actions(
                     **mi, num_steps=self._num_flow_steps)
@@ -287,8 +293,8 @@ class FastMolmoBot:
                 pass
         return out[0]
 
-    def _run_cached(self, mi):
-        key = hash_inputs(mi["input_ids"], None)
+    def _run_cached(self, mi, cache_key=None):
+        key = cache_key if cache_key is not None else hash_inputs(mi["input_ids"], None)
         if key == self._backbone_cache_key and self._cached_layer_states is not None:
             self._backbone_cache_hits += 1
             ls, em = self._cached_layer_states, self._cached_encoder_attn_mask
