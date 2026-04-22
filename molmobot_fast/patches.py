@@ -165,12 +165,21 @@ def _ae_precompute_context(ae, encoder_hidden_states, encoder_attention_mask=Non
                            state_embeddings=None, states_mode="cross_attn"):
     bsz = encoder_hidden_states[0].shape[0]
     encoded_states = ae._encode_states(state_embeddings)
+    all_visible = (
+        isinstance(encoder_attention_mask, torch.Tensor)
+        and encoder_attention_mask.dtype == torch.bool
+        and bool(torch.all(encoder_attention_mask))
+    )
     if states_mode == "self_attn":
         contexts = ae._prepare_context(encoder_hidden_states, None)
-        cross_mask = ae._build_cross_attention_mask(encoder_attention_mask, None, bsz, contexts[0].dtype)
+        cross_mask = None if all_visible else ae._build_cross_attention_mask(
+            encoder_attention_mask, None, bsz, contexts[0].dtype
+        )
     else:
         contexts = ae._prepare_context(encoder_hidden_states, encoded_states)
-        cross_mask = ae._build_cross_attention_mask(encoder_attention_mask, encoded_states, bsz, contexts[0].dtype)
+        cross_mask = None if all_visible else ae._build_cross_attention_mask(
+            encoder_attention_mask, encoded_states, bsz, contexts[0].dtype
+        )
     cached_cross_kvs = [blk.precompute_cross_kv(ctx) for blk, ctx in zip(ae.blocks, contexts)]
     # Once cross-attn K/V tensors are precomputed, the full context tensors are no longer
     # needed by block.forward; dropping them avoids redundant graph replay copies.
@@ -194,12 +203,21 @@ def _ae_forward(ae, actions, timesteps, encoder_hidden_states,
     else:
         encoded_states = ae._encode_states(state_embeddings)
         cached_cross_kvs = [None] * len(ae.blocks)
+        all_visible = (
+            isinstance(encoder_attention_mask, torch.Tensor)
+            and encoder_attention_mask.dtype == torch.bool
+            and bool(torch.all(encoder_attention_mask))
+        )
         if states_mode == "self_attn":
             contexts = ae._prepare_context(encoder_hidden_states, None)
-            cross_mask = ae._build_cross_attention_mask(encoder_attention_mask, None, bsz, x.dtype)
+            cross_mask = None if all_visible else ae._build_cross_attention_mask(
+                encoder_attention_mask, None, bsz, x.dtype
+            )
         else:
             contexts = ae._prepare_context(encoder_hidden_states, encoded_states)
-            cross_mask = ae._build_cross_attention_mask(encoder_attention_mask, encoded_states, bsz, x.dtype)
+            cross_mask = None if all_visible else ae._build_cross_attention_mask(
+                encoder_attention_mask, encoded_states, bsz, x.dtype
+            )
 
     if states_mode == "self_attn" and encoded_states is not None:
         x = torch.cat([encoded_states, x], dim=1)
