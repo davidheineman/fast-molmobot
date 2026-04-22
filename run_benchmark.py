@@ -134,18 +134,17 @@ RESET = "\033[0m"
 
 def print_table(rows):
     base = rows[0]["mean"]
-    W = 108
+    W = 92
 
     print()
     print(f"{BOLD}{'─' * W}{RESET}")
     print(f"{BOLD}  MolmoBot-Fast  Ablation Benchmark   (H100 80GB, bf16, 2×640×360 cameras){RESET}")
     print(f"{BOLD}{'─' * W}{RESET}")
     hdr = (
-        f"  {'Configuration':<42} {'Mean':>7} {'Med':>7} {'P95':>7} "
-        f"{'Eff.Hz':>7} {'GPU%':>5} {'Mem':>6} {'Speedup':>8}"
+        f"  {'Configuration':<42} {'Mean':>7} {'Eff.Hz':>7} {'GPU%':>5} {'Speedup':>8}"
     )
     print(f"{BOLD}{hdr}{RESET}")
-    print(f"  {'─' * 104}")
+    print(f"  {'─' * 88}")
 
     for i, r in enumerate(rows):
         sp = base / r["mean"]
@@ -158,33 +157,23 @@ def print_table(rows):
             sp_col = DIM
 
         mean_s = f"{r['mean']:.1f}ms"
-        med_s = f"{r['med']:.1f}ms"
-        p95_s = f"{r['p95']:.1f}ms"
         hz_s = f"{r['hz']:.0f}"
         gpu_s = f"{r['gpu']:.0f}%"
-        mem_s = f"{r['mem']/1024:.1f}G"
 
         if i == 0:
             line = (
-                f"  {r['label']:<42} {mean_s:>7} {med_s:>7} {p95_s:>7} "
-                f"{hz_s:>7} {gpu_s:>5} {mem_s:>6} {DIM}{'base':>8}{RESET}"
+                f"  {r['label']:<42} {mean_s:>7} {hz_s:>7} {gpu_s:>5} {DIM}{'base':>8}{RESET}"
             )
         else:
             line = (
-                f"  {r['label']:<42} {mean_s:>7} {med_s:>7} {p95_s:>7} "
-                f"{hz_s:>7} {gpu_s:>5} {mem_s:>6} {sp_col}{sp_str:>8}{RESET}"
+                f"  {r['label']:<42} {mean_s:>7} {hz_s:>7} {gpu_s:>5} {sp_col}{sp_str:>8}{RESET}"
             )
         print(line)
 
         if i == 0 or (i < len(rows) - 1 and rows[i + 1].get("_sep")):
-            print(f"  {'─' * 104}")
+            print(f"  {'─' * 88}")
 
     print(f"{BOLD}{'─' * W}{RESET}")
-    best = min(rows, key=lambda r: r["mean"])
-    print(
-        f"  Best: {GREEN}{BOLD}{best['label']}{RESET} at {GREEN}{best['med']:.1f}ms{RESET} "
-        f"({base / best['mean']:.1f}x faster than baseline)"
-    )
     print()
 
 
