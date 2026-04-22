@@ -62,7 +62,7 @@ class FastMolmoBot:
 
         self._load_model(checkpoint, device, num_flow_steps)
         self._apply_patches(
-            cuda_graph, flash_attn, compile_backbone, fp8, tensorrt)
+            cuda_graph, flash_attn, compile_backbone, async_preprocess, fp8, tensorrt)
         self._init_async(async_preprocess, device)
 
         self._cache_backbone = cache_backbone
@@ -121,10 +121,13 @@ class FastMolmoBot:
 
     # ── apply optimizations ──────────────────────────────────────────────
 
-    def _apply_patches(self, cuda_graph, flash_attn, compile_bb, fp8, tensorrt):
+    def _apply_patches(self, cuda_graph, flash_attn, compile_bb, async_preprocess, fp8, tensorrt):
         patch_action_expert(self._model)
         patch_molmobot(self._model)
-        if flash_attn:
+        self._model._enable_compiled_ae_step = False
+        # In this stack, FA2 tends to regress latency once compile_backbone is on.
+        use_flash = flash_attn and not compile_bb
+        if use_flash:
             patch_flash_attention(self._model)
         if fp8:
             patch_fp8_quantize(self._model)
