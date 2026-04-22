@@ -354,7 +354,7 @@ def _capture_flow_graph(model, trajectory, layer_states, cached_ctx, steps):
                     traj, t, layer_states, cached_context=g_cached),
                 "action-expert-step",
                 mode="max-autotune-no-cudagraphs",
-                fullgraph=True,
+                fullgraph=False,
             )
             dt = 1.0 / steps
 
