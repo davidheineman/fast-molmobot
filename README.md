@@ -1,6 +1,6 @@
 Adds CUDA graph compilation, flash attention and kv-caching to speed-up [MolmoBot](https://github.com/allenai/MolmoBot) inference. 
 
-On 1 H100 this leads to 4.5x speedup. When using 10 -> 5 flow steps and assuming generous cache hits, this leads to 11x speedup.
+On 1 H100 this leads to 6.5x speedup. When using 10 -> 5 flow steps and assuming generous cache hits, this leads to 19x speedup.
 
 ## setup
 
