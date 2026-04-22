@@ -531,14 +531,10 @@ def _patch_ae_fa2(model, fa_func):
 # ═══════════════════════════════════════════════════════════════════════════
 
 def patch_compile_backbone(model):
-    compile_opts = {
-        "mode": "max-autotune-no-cudagraphs",
-        "fullgraph": False,
-    }
     llm = 0
     llm_skipped = 0
     for i, blk in enumerate(model.transformer.blocks):
-        compiled = _safe_compile_module(blk, f"llm.block.{i}", **compile_opts)
+        compiled = _safe_compile_module(blk, f"llm.block.{i}")
         model.transformer.blocks[i] = compiled
         if compiled is blk:
             llm_skipped += 1
@@ -556,7 +552,7 @@ def patch_compile_backbone(model):
                 rb = getattr(tr, "resblocks", None)
                 if rb:
                     for i, blk in enumerate(rb):
-                        compiled = _safe_compile_module(blk, f"vit.block.{i}", **compile_opts)
+                        compiled = _safe_compile_module(blk, f"vit.block.{i}")
                         rb[i] = compiled
                         if compiled is blk:
                             vit_skipped += 1
