@@ -27,50 +27,41 @@ python run_benchmark.py
 output (1 H100, PyTorch 2.7.1+cu126):
 
 ```sh
-────────────────────────────────────────────────────────────────────────────────────────────────────────────
+────────────────────────────────────────────────────────────────────────────────────────────
   MolmoBot-Fast  Ablation Benchmark   (H100 80GB, bf16, 2×640×360 cameras)
-────────────────────────────────────────────────────────────────────────────────────────────────────────────
-  Configuration                                 Mean     Med     P95  Eff.Hz  GPU%    Mem  Speedup
-  ────────────────────────────────────────────────────────────────────────────────────────────────────────
-  Baseline (no optimizations)                311ms   285ms   395ms       51   30%  11.6G     base
-  ────────────────────────────────────────────────────────────────────────────────────────────────────────
-  + CUDA Graph                                86ms    85ms    87ms      187   84%  12.1G     3.6x
-  + CUDA Graph + FlashAttention-2             99ms    98ms   102ms      162   74%  12.8G     3.2x
-  + CUDA Graph + FA2 + Compiled Backbone      73ms    72ms    74ms      220   83%  12.1G     4.3x
-  ────────────────────────────────────────────────────────────────────────────────────────────────────────
-  + All opts (10 steps)                       69ms    68ms    73ms      233   87%  12.8G     4.5x
-  ────────────────────────────────────────────────────────────────────────────────────────────────────────
-  All opts, 5 flow steps                      45ms    44ms    46ms      359   83%  12.1G     7.0x
-  All opts + backbone cache (5 steps)         28ms    28ms    29ms      567   83%  12.8G    11.0x
-────────────────────────────────────────────────────────────────────────────────────────────────────────────
-  Best: All opts + backbone cache (5 steps) at 28ms (11.0x faster than baseline)
+────────────────────────────────────────────────────────────────────────────────────────────
+  Configuration                                 Mean  Eff.Hz  GPU%  Speedup
+  ────────────────────────────────────────────────────────────────────────────────────────
+  Baseline (no optimizations)                261.9ms      61   33%     base
+  ────────────────────────────────────────────────────────────────────────────────────────
+  + CUDA Graph                                77.3ms     207   83%     3.4x
+  + CUDA Graph + FlashAttention-2             81.6ms     196   81%     3.2x
+  + CUDA Graph + FA2 + Compiled Backbone      64.4ms     248   85%     4.1x
+  ────────────────────────────────────────────────────────────────────────────────────────
+  + All opts (10 steps)                       40.4ms     396   91%     6.5x
+  ────────────────────────────────────────────────────────────────────────────────────────
+  All opts, 5 flow steps                      30.2ms     529   86%     8.7x
+  All opts + backbone cache (5 steps, same obs)  13.3ms    1207   64%    19.8x
+────────────────────────────────────────────────────────────────────────────────────────────
 ```
 
 ### discussion
 
-Why don't we see 50x speedups like vLLM vs. HF? This is because we aren't batching requests:
+**vLLM**: Why don't we see 50x speedups like vLLM vs. HF? This is because we aren't batching requests. vLLM's biggest speedup is 10x throughput via better managing batches.
 
-| | vLLM vs HuggingFace | MolmoBot-Fast vs baseline |
-|---|---|---|
-| Bottleneck | Memory-bandwidth (decode) | Compute (dense forward pass) |
-| Key win | Batching + PagedAttention | CUDA graph + KV caching |
-| Concurrency | Many requests | Single request |
-| Single-request speedup | ~1.5-2x | ~4x |
-| Throughput speedup | 10-24x | N/A (batch=1) |
+**Changes to model**: The next two biggest jumps would come from: (1) training a smaller model (a MolmoBot 1.7B or 0.6B) and using speculating decoding and (2) using flow-matching to perform diffusion in one step.
 
-The next two biggest jumps would come from: (1) training a smaller model (a MolmoBot 1.7B or 0.6B) and using speculating decoding and (2) using flow-matching to perform diffusion in one step.
+**Failures**: I tried FP8 inference and TensorRT, but single-batch inference is memory-bandwidth bound, not comput-bound.
 
-I tried FP8 inference and TensorRT, but single-batch inference is memory-bandwidth bound, not comput-bound.
-
-Finally, when we run a profiler, we can see the bottleneck is in the 500M DiT model which runs 10 diffusion steps for each chunk of actions:
+**Profiler**: Finally, when we run a profiler, we can see the bottleneck is in the 500M DiT model which runs 10 diffusion steps for each chunk of actions:
 
 | Stage | Time | % |
-|---|---|---|
-| AE Flow Loop (x10) | 42.6 ms | 60% |
-| Backbone (ViT+LLM) | 21.5 ms | 30% |
-| CPU Preprocess | 4.3 ms | 6% |
-| AE Context Build | 2.2 ms | 3% |
-| H2D + D2H transfers | 0.1 ms | ~0% |
+|---|---:|---:|
+| AE Flow Loop (x10) | 35.6 ms | 58.0% |
+| Backbone (ViT+LLM) | 19.9 ms | 32.5% |
+| CPU Preprocess | 4.2 ms | 6.8% |
+| AE Context Build | 1.6 ms | 2.6% |
+| H2D + D2H transfers | 0.12 ms | ~0.2% |
 
 ## api
 
