@@ -1,9 +1,8 @@
 import argparse
+import logging
 import subprocess
-import sys
 import threading
 import time
-import logging
 
 import numpy as np
 import torch
@@ -13,34 +12,54 @@ log = logging.getLogger(__name__)
 
 
 class _GPUMonitor:
-    def __init__(self, gpu_id=0, interval=0.05):
-        self._gpu_id, self._interval = gpu_id, interval
-        self._samples, self._stop, self._thread = [], threading.Event(), None
+    """Lightweight nvidia-smi poller used during benchmark loops."""
+
+    def __init__(self, gpu_id: int = 0, interval: float = 0.05):
+        self._gpu_id = gpu_id
+        self._interval = interval
+        self._samples = []
+        self._stop = threading.Event()
+        self._thread = None
 
     def start(self):
-        self._samples.clear(); self._stop.clear()
-        self._thread = threading.Thread(target=self._poll, daemon=True); self._thread.start()
+        self._samples.clear()
+        self._stop.clear()
+        self._thread = threading.Thread(target=self._poll, daemon=True)
+        self._thread.start()
 
     def stop(self):
         self._stop.set()
-        if self._thread: self._thread.join(timeout=2)
+        if self._thread:
+            self._thread.join(timeout=2)
 
     def _poll(self):
         while not self._stop.is_set():
             try:
                 out = subprocess.check_output(
-                    ["nvidia-smi", "--query-gpu=utilization.gpu,memory.used",
-                     "--format=csv,noheader,nounits", "-i", str(self._gpu_id)],
-                    text=True, timeout=1).strip()
+                    [
+                        "nvidia-smi",
+                        "--query-gpu=utilization.gpu,memory.used",
+                        "--format=csv,noheader,nounits",
+                        "-i",
+                        str(self._gpu_id),
+                    ],
+                    text=True,
+                    timeout=1,
+                ).strip()
                 parts = out.split(",")
-                if len(parts) == 2: self._samples.append((float(parts[0]), float(parts[1])))
-            except Exception: pass
+                if len(parts) == 2:
+                    self._samples.append((float(parts[0]), float(parts[1])))
+            except Exception:
+                pass
             time.sleep(self._interval)
 
     @property
-    def gpu_util(self): return np.mean([s[0] for s in self._samples]) if self._samples else 0
+    def gpu_util(self):
+        return np.mean([sample[0] for sample in self._samples]) if self._samples else 0
+
     @property
-    def gpu_mem(self): return np.mean([s[1] for s in self._samples]) if self._samples else 0
+    def gpu_mem(self):
+        return np.mean([sample[1] for sample in self._samples]) if self._samples else 0
 
 
 def run(args):
@@ -84,7 +103,7 @@ def run(args):
         torch.cuda.synchronize()
         latencies.append((time.perf_counter() - t0) * 1000)
         if (i + 1) % 10 == 0:
-            log.info(f"  [{i+1}/{args.iterations}] last-10 avg: {np.mean(latencies[-10:]):.1f} ms")
+            log.info("  [%d/%d] last-10 avg: %.1f ms", i + 1, args.iterations, np.mean(latencies[-10:]))
 
     monitor.stop()
     lat = np.array(latencies)
@@ -105,7 +124,12 @@ def run(args):
 
 def main():
     p = argparse.ArgumentParser(description="MolmoBot-Fast Benchmark")
-    p.add_argument("--checkpoint", type=str, default=None, help="Path or auto-download allenai/MolmoBot-DROID")
+    p.add_argument(
+        "--checkpoint",
+        type=str,
+        default=None,
+        help="Path or auto-download allenai/MolmoBot-DROID",
+    )
     p.add_argument("--iterations", type=int, default=50)
     p.add_argument("--flow-steps", type=int, default=10)
     p.add_argument("--cache-backbone", action="store_true", help="Reuse same images (backbone cache test)")

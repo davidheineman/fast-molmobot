@@ -7,7 +7,6 @@ import numpy as np
 import torch
 
 from molmobot_fast.patches import (
-    ActionExpertCachedContext,
     _patch_ae_fa2,
     _patch_vit_fa2,
     _finalize_fp8,
@@ -146,7 +145,7 @@ class FastMolmoBot:
                     ae_layers,
                 )
             except ImportError:
-                pass
+                log.warning("FlashAttention-2 requested but not available.")
         if fp8:
             patch_fp8_quantize(self._model)
         self._needs_fp8_finalize = fp8
@@ -198,9 +197,7 @@ class FastMolmoBot:
             if isinstance(img, np.ndarray):
                 if img.dtype != np.uint8:
                     img = (img * 255).astype(np.uint8) if img.max() <= 1.0 else img.astype(np.uint8)
-                result.append(img)
-            else:
-                result.append(img)
+            result.append(img)
         return result
 
     def _prepare_state(self, state):
@@ -244,32 +241,25 @@ class FastMolmoBot:
         return batch
 
     def _to_gpu(self, batch):
-        if self._gpu_buffer_pool:
-            out = {}
-            for k, v in batch.items():
-                if isinstance(v, torch.Tensor):
-                    buf = self._gpu_buffer_pool.get(k)
-                    if buf is not None and buf.shape == v.shape and buf.dtype == v.dtype:
-                        buf.copy_(v, non_blocking=True)
-                        out[k] = buf
-                    else:
-                        t = v.to(self.device, non_blocking=True)
-                        self._gpu_buffer_pool[k] = t
-                        out[k] = t
-                else:
-                    out[k] = v
-            return out
-        else:
+        if not self._gpu_buffer_pool:
             self._gpu_buffer_pool = {}
-            out = {}
-            for k, v in batch.items():
-                if isinstance(v, torch.Tensor):
-                    t = v.to(self.device, non_blocking=True)
-                    self._gpu_buffer_pool[k] = t
-                    out[k] = t
-                else:
-                    out[k] = v
-            return out
+
+        out = {}
+        for k, v in batch.items():
+            if not isinstance(v, torch.Tensor):
+                out[k] = v
+                continue
+
+            buf = self._gpu_buffer_pool.get(k)
+            if buf is not None and buf.shape == v.shape and buf.dtype == v.dtype:
+                buf.copy_(v, non_blocking=True)
+                out[k] = buf
+                continue
+
+            t = v.to(self.device, non_blocking=True)
+            self._gpu_buffer_pool[k] = t
+            out[k] = t
+        return out
 
     # ── inference ────────────────────────────────────────────────────────
 

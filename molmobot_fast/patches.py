@@ -647,6 +647,42 @@ def patch_compile_backbone(model):
 #  5. FP8 quantization (LOSSY — changes numerical precision)
 # ═══════════════════════════════════════════════════════════════════════════
 
+
+def _finalize_fp8_linear(mod):
+    """Freeze calibrated activation scale and install FP8 forward."""
+    e4m3_max = torch.finfo(torch.float8_e4m3fn).max
+
+    mod._calib_handle.remove()
+    del mod._calib_handle
+
+    act_amax = mod._calib_amax.clamp(min=1e-12)
+    act_scale = (e4m3_max / act_amax).float()
+    mod.act_scale = act_scale
+    mod.act_scale_inv = (1.0 / act_scale).float()
+    del mod._calib_amax
+
+    def fp8_forward(x, _m=mod, _e4=e4m3_max):
+        x_flat = x.reshape(-1, x.shape[-1])
+        x_fp8 = (x_flat.float() * _m.act_scale).clamp(-_e4, _e4).to(torch.float8_e4m3fn)
+        out = torch._scaled_mm(
+            x_fp8,
+            _m.weight_fp8.T,
+            scale_a=_m.act_scale_inv,
+            scale_b=_m.w_scale_inv,
+            out_dtype=torch.bfloat16,
+        )
+        if _m.bias is not None:
+            out = out + _m.bias
+        return out.view(*x.shape[:-1], out.shape[-1])
+
+    mod.forward = fp8_forward
+
+
+def _finalize_all_fp8(modules):
+    for mod in modules:
+        _finalize_fp8_linear(mod)
+
+
 def patch_fp8_quantize(model, *, quantize_backbone=True, quantize_action_expert=True):
     """Replace eligible Linear layers with FP8 static-weight, dynamic-activation matmuls.
 
@@ -687,35 +723,10 @@ def patch_fp8_quantize(model, *, quantize_backbone=True, quantize_action_expert=
             m._calib_amax = torch.max(m._calib_amax, amax)
         mod._calib_handle = mod.register_forward_hook(hook)
 
-    def _finalize_linear(mod):
-        """Freeze calibrated activation scale and install FP8 forward."""
-        mod._calib_handle.remove()
-        del mod._calib_handle
-
-        act_amax = mod._calib_amax.clamp(min=1e-12)
-        act_scale = (E4M3_MAX / act_amax).float()
-        mod.act_scale = act_scale
-        mod.act_scale_inv = (1.0 / act_scale).float()
-        del mod._calib_amax
-
-        def fp8_forward(x, _m=mod, _e4=E4M3_MAX):
-            x_flat = x.reshape(-1, x.shape[-1])
-            x_fp8 = (x_flat.float() * _m.act_scale).clamp(-_e4, _e4).to(torch.float8_e4m3fn)
-            out = torch._scaled_mm(
-                x_fp8, _m.weight_fp8.T,
-                scale_a=_m.act_scale_inv,
-                scale_b=_m.w_scale_inv,
-                out_dtype=torch.bfloat16,
-            )
-            if _m.bias is not None:
-                out = out + _m.bias
-            return out.view(*x.shape[:-1], out.shape[-1])
-        mod.forward = fp8_forward
-
     bb_count = ae_count = skipped = 0
 
     if quantize_backbone:
-        for fqn, mod in model.transformer.named_modules():
+        for _, mod in model.transformer.named_modules():
             if _fp8_eligible(mod):
                 _prepare_linear(mod)
                 _install_calib_hook(mod)
@@ -724,7 +735,7 @@ def patch_fp8_quantize(model, *, quantize_backbone=True, quantize_action_expert=
                 skipped += 1
 
     if quantize_action_expert:
-        for fqn, mod in model.action_expert.named_modules():
+        for _, mod in model.action_expert.named_modules():
             if _fp8_eligible(mod):
                 _prepare_linear(mod)
                 _install_calib_hook(mod)
@@ -736,37 +747,12 @@ def patch_fp8_quantize(model, *, quantize_backbone=True, quantize_action_expert=
              f"({skipped} skipped)... running calibration forward passes")
 
     model._fp8_eligible_mods = eligible_mods
-    model._fp8_finalize = lambda: _finalize_all(eligible_mods)
+    model._fp8_finalize = lambda: _finalize_all_fp8(eligible_mods)
 
 
 def _finalize_fp8(model):
     """Called after calibration forward passes to freeze FP8 scales."""
-    for mod in model._fp8_eligible_mods:
-        _mod = mod
-        E4M3_MAX = torch.finfo(torch.float8_e4m3fn).max
-
-        _mod._calib_handle.remove()
-        del _mod._calib_handle
-
-        act_amax = _mod._calib_amax.clamp(min=1e-12)
-        act_scale = (E4M3_MAX / act_amax).float()
-        _mod.act_scale = act_scale
-        _mod.act_scale_inv = (1.0 / act_scale).float()
-        del _mod._calib_amax
-
-        def fp8_forward(x, _m=_mod, _e4=E4M3_MAX):
-            x_flat = x.reshape(-1, x.shape[-1])
-            x_fp8 = (x_flat.float() * _m.act_scale).clamp(-_e4, _e4).to(torch.float8_e4m3fn)
-            out = torch._scaled_mm(
-                x_fp8, _m.weight_fp8.T,
-                scale_a=_m.act_scale_inv,
-                scale_b=_m.w_scale_inv,
-                out_dtype=torch.bfloat16,
-            )
-            if _m.bias is not None:
-                out = out + _m.bias
-            return out.view(*x.shape[:-1], out.shape[-1])
-        _mod.forward = fp8_forward
+    _finalize_all_fp8(model._fp8_eligible_mods)
 
     del model._fp8_eligible_mods
     del model._fp8_finalize
