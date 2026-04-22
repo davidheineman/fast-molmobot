@@ -1,5 +1,4 @@
 import concurrent.futures
-import hashlib
 import logging
 import time
 from typing import Dict, List, Optional, Union
@@ -8,7 +7,8 @@ import numpy as np
 import torch
 
 from molmobot_fast.patches import (
-    ActionExpertCachedContext,
+    _patch_ae_fa2,
+    _patch_vit_fa2,
     _finalize_fp8,
     hash_inputs,
     patch_action_expert,
@@ -63,7 +63,7 @@ class FastMolmoBot:
 
         self._load_model(checkpoint, device, num_flow_steps)
         self._apply_patches(
-            cuda_graph, flash_attn, compile_backbone, fp8, tensorrt)
+            cuda_graph, flash_attn, compile_backbone, async_preprocess, fp8, tensorrt)
         self._init_async(async_preprocess, device)
 
         self._cache_backbone = cache_backbone
@@ -122,11 +122,30 @@ class FastMolmoBot:
 
     # ── apply optimizations ──────────────────────────────────────────────
 
-    def _apply_patches(self, cuda_graph, flash_attn, compile_bb, fp8, tensorrt):
+    def _apply_patches(self, cuda_graph, flash_attn, compile_bb, async_preprocess, fp8, tensorrt):
         patch_action_expert(self._model)
         patch_molmobot(self._model)
-        if flash_attn:
+        self._model._enable_compiled_ae_step = bool(
+            compile_bb and async_preprocess and cuda_graph
+        )
+        # In this stack, FA2 tends to regress latency once compile_backbone is on.
+        use_flash = flash_attn and not compile_bb
+        if use_flash:
             patch_flash_attention(self._model)
+        elif flash_attn and compile_bb:
+            # Keep backbone on SDPA when compiled, but still enable FA2 kernels
+            # for action expert attention where flow-loop latency dominates.
+            try:
+                from flash_attn import flash_attn_func
+                vit_layers = _patch_vit_fa2(self._model, flash_attn_func)
+                ae_layers = _patch_ae_fa2(self._model, flash_attn_func)
+                log.info(
+                    "FlashAttention-2 (ViT+AE): %d ViT + %d AE layers",
+                    vit_layers,
+                    ae_layers,
+                )
+            except ImportError:
+                log.warning("FlashAttention-2 requested but not available.")
         if fp8:
             patch_fp8_quantize(self._model)
         self._needs_fp8_finalize = fp8
@@ -178,9 +197,7 @@ class FastMolmoBot:
             if isinstance(img, np.ndarray):
                 if img.dtype != np.uint8:
                     img = (img * 255).astype(np.uint8) if img.max() <= 1.0 else img.astype(np.uint8)
-                result.append(img)
-            else:
-                result.append(img)
+            result.append(img)
         return result
 
     def _prepare_state(self, state):
@@ -205,7 +222,13 @@ class FastMolmoBot:
             example["state"] = state
         processed = self._preprocessor(example)
         batch = self._collator([processed])
-        return self._pin(batch)
+        batch = self._pin(batch)
+        if self._cache_backbone:
+            input_ids = batch.get("input_ids")
+            if isinstance(input_ids, torch.Tensor):
+                # Keep cache-key hashing on CPU tensors to avoid GPU->CPU sync.
+                batch["_backbone_cache_key"] = hash_inputs(input_ids, None)
+        return batch
 
     @staticmethod
     def _pin(batch):
@@ -218,32 +241,25 @@ class FastMolmoBot:
         return batch
 
     def _to_gpu(self, batch):
-        if self._gpu_buffer_pool:
-            out = {}
-            for k, v in batch.items():
-                if isinstance(v, torch.Tensor):
-                    buf = self._gpu_buffer_pool.get(k)
-                    if buf is not None and buf.shape == v.shape and buf.dtype == v.dtype:
-                        buf.copy_(v, non_blocking=True)
-                        out[k] = buf
-                    else:
-                        t = v.to(self.device, non_blocking=True)
-                        self._gpu_buffer_pool[k] = t
-                        out[k] = t
-                else:
-                    out[k] = v
-            return out
-        else:
+        if not self._gpu_buffer_pool:
             self._gpu_buffer_pool = {}
-            out = {}
-            for k, v in batch.items():
-                if isinstance(v, torch.Tensor):
-                    t = v.to(self.device, non_blocking=True)
-                    self._gpu_buffer_pool[k] = t
-                    out[k] = t
-                else:
-                    out[k] = v
-            return out
+
+        out = {}
+        for k, v in batch.items():
+            if not isinstance(v, torch.Tensor):
+                out[k] = v
+                continue
+
+            buf = self._gpu_buffer_pool.get(k)
+            if buf is not None and buf.shape == v.shape and buf.dtype == v.dtype:
+                buf.copy_(v, non_blocking=True)
+                out[k] = buf
+                continue
+
+            t = v.to(self.device, non_blocking=True)
+            self._gpu_buffer_pool[k] = t
+            out[k] = t
+        return out
 
     # ── inference ────────────────────────────────────────────────────────
 
@@ -268,10 +284,11 @@ class FastMolmoBot:
             "input_ids", "attention_mask", "position_ids", "response_mask",
             "images", "image_masks", "token_pooling", "low_res_token_pooling", "states",
         ) if k in batch and batch.get(k) is not None}
+        cache_key = batch.get("_backbone_cache_key") if self._cache_backbone else None
 
         with torch.no_grad(), torch.autocast(device_type="cuda", dtype=torch.bfloat16):
             if self._cache_backbone:
-                actions = self._run_cached(mi)
+                actions = self._run_cached(mi, cache_key=cache_key)
             else:
                 actions = self._model.generate_actions(
                     **mi, num_steps=self._num_flow_steps)
@@ -287,8 +304,8 @@ class FastMolmoBot:
                 pass
         return out[0]
 
-    def _run_cached(self, mi):
-        key = hash_inputs(mi["input_ids"], mi.get("images"))
+    def _run_cached(self, mi, cache_key=None):
+        key = cache_key if cache_key is not None else hash_inputs(mi["input_ids"], None)
         if key == self._backbone_cache_key and self._cached_layer_states is not None:
             self._backbone_cache_hits += 1
             ls, em = self._cached_layer_states, self._cached_encoder_attn_mask

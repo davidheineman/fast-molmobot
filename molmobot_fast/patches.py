@@ -1,4 +1,5 @@
 import hashlib
+import importlib.util
 import logging
 from dataclasses import dataclass
 from typing import Optional, Sequence, Tuple
@@ -8,15 +9,60 @@ import torch.nn.functional as F
 
 log = logging.getLogger(__name__)
 
+
+def _compile_supported() -> bool:
+    # Some nightly/staged torch wheels miss this module needed by torch.compile.
+    return (
+        hasattr(torch, "compile")
+        and importlib.util.find_spec("torch._subclasses.schema_check_mode") is not None
+    )
+
+
+_CAN_COMPILE = _compile_supported()
+
+
+def _safe_compile_callable(fn, label: str, **compile_kwargs):
+    if not _CAN_COMPILE:
+        return fn
+    try:
+        compiled = torch.compile(fn, **compile_kwargs)
+    except Exception as exc:
+        log.warning("torch.compile unavailable for %s: %s", label, exc)
+        return fn
+
+    failed = {"value": False}
+
+    def wrapped(*args, **kwargs):
+        if failed["value"]:
+            return fn(*args, **kwargs)
+        try:
+            return compiled(*args, **kwargs)
+        except Exception as exc:
+            failed["value"] = True
+            log.warning("Falling back to eager %s after compile failure: %s", label, exc)
+            return fn(*args, **kwargs)
+
+    return wrapped
+
+
+def _safe_compile_module(module, label: str, **compile_kwargs):
+    if not _CAN_COMPILE:
+        return module
+    try:
+        return torch.compile(module, **compile_kwargs)
+    except Exception as exc:
+        log.warning("torch.compile unavailable for %s: %s", label, exc)
+        return module
+
 # ═══════════════════════════════════════════════════════════════════════════
 #  Cached-context dataclass (used by the action expert KV cache)
 # ═══════════════════════════════════════════════════════════════════════════
 
 @dataclass
 class ActionExpertCachedContext:
-    contexts: Sequence[torch.Tensor]
+    contexts: Sequence[Optional[torch.Tensor]]
     cross_mask: Optional[torch.Tensor]
-    cached_cross_kvs: list
+    cached_cross_kvs: torch.Tensor
     encoded_states: Optional[torch.Tensor]
     states_mode: str
 
@@ -24,9 +70,11 @@ class ActionExpertCachedContext:
 #  1. Action Expert patches — SDPA, precomputed KV, context caching
 # ═══════════════════════════════════════════════════════════════════════════
 
-@torch.compile
-def _compiled_modulate(x, shift, scale):
+def _modulate(x, shift, scale):
     return x * (1 + scale.unsqueeze(1)) + shift.unsqueeze(1)
+
+
+_compiled_modulate = _safe_compile_callable(_modulate, "_modulate")
 
 
 def patch_action_expert(model):
@@ -45,7 +93,7 @@ def patch_action_expert(model):
     from olmo.nn.action_expert import ActionExpertBlock, ActionExpertMLP
     for mod in model.modules():
         if isinstance(mod, ActionExpertMLP):
-            mod.forward = torch.compile(mod.forward)
+            mod.forward = _safe_compile_callable(mod.forward, f"{type(mod).__name__}.forward")
 
     for mod in model.modules():
         if isinstance(mod, ActionExpertBlock):
@@ -113,18 +161,65 @@ def _make_ae_block_forward(mod):
     return forward
 
 
+def _stack_cross_kvs(cached_cross_kvs: Sequence[Tuple[torch.Tensor, torch.Tensor]]
+                     ) -> torch.Tensor:
+    ks = torch.stack([k for k, _ in cached_cross_kvs], dim=0).contiguous()
+    vs = torch.stack([v for _, v in cached_cross_kvs], dim=0).contiguous()
+    return torch.stack((ks, vs), dim=0).contiguous()
+
+
+def _project_context_layers(ae, encoder_hidden_states: Sequence[torch.Tensor]) -> Sequence[torch.Tensor]:
+    if not encoder_hidden_states:
+        return []
+    batch_size = encoder_hidden_states[0].shape[0]
+    # Fuse context projection + norm across all selected backbone layers to cut launch overhead.
+    stacked = torch.cat(tuple(encoder_hidden_states), dim=0)
+    projected = ae.context_norm(ae.context_proj(stacked))
+    return projected.split(batch_size, dim=0)
+
+
 def _ae_precompute_context(ae, encoder_hidden_states, encoder_attention_mask=None,
                            state_embeddings=None, states_mode="cross_attn"):
     bsz = encoder_hidden_states[0].shape[0]
+    ctx_dtype = encoder_hidden_states[0].dtype
     encoded_states = ae._encode_states(state_embeddings)
+    all_visible = (
+        isinstance(encoder_attention_mask, torch.Tensor)
+        and encoder_attention_mask.dtype == torch.bool
+        and bool(torch.all(encoder_attention_mask))
+    )
+    cached_cross_kvs = []
+    projected_contexts = _project_context_layers(ae, encoder_hidden_states)
     if states_mode == "self_attn":
-        contexts = ae._prepare_context(encoder_hidden_states, None)
-        cross_mask = ae._build_cross_attention_mask(encoder_attention_mask, None, bsz, contexts[0].dtype)
+        cross_mask = None if all_visible else ae._build_cross_attention_mask(
+            encoder_attention_mask, None, bsz, ctx_dtype
+        )
+        for blk, ctx in zip(ae.blocks, projected_contexts):
+            cached_cross_kvs.append(blk.precompute_cross_kv(ctx))
+        cached_encoded_states = encoded_states
     else:
-        contexts = ae._prepare_context(encoder_hidden_states, encoded_states)
-        cross_mask = ae._build_cross_attention_mask(encoder_attention_mask, encoded_states, bsz, contexts[0].dtype)
-    cached_cross_kvs = [blk.precompute_cross_kv(ctx) for blk, ctx in zip(ae.blocks, contexts)]
-    return ActionExpertCachedContext(contexts, cross_mask, cached_cross_kvs, encoded_states, states_mode)
+        cross_mask = None if all_visible else ae._build_cross_attention_mask(
+            encoder_attention_mask, encoded_states, bsz, ctx_dtype
+        )
+        for blk, ctx in zip(ae.blocks, projected_contexts):
+            if encoded_states is not None:
+                ctx = torch.cat([ctx, encoded_states], dim=1)
+            cached_cross_kvs.append(blk.precompute_cross_kv(ctx))
+        # In cross-attn mode encoded_states are only used to build cross context/mask.
+        # The flow loop consumes precomputed cross K/V tensors directly.
+        cached_encoded_states = None
+
+    stacked_cross_kvs = _stack_cross_kvs(cached_cross_kvs)
+    # Once cross-attn K/V tensors are precomputed, the full context tensors are no longer
+    # needed by block.forward; dropping them avoids redundant graph replay copies.
+    contexts = tuple(None for _ in cached_cross_kvs)
+    return ActionExpertCachedContext(
+        contexts,
+        cross_mask,
+        stacked_cross_kvs,
+        cached_encoded_states,
+        states_mode,
+    )
 
 
 def _ae_forward(ae, actions, timesteps, encoder_hidden_states,
@@ -142,13 +237,22 @@ def _ae_forward(ae, actions, timesteps, encoder_hidden_states,
         states_mode = cached_context.states_mode
     else:
         encoded_states = ae._encode_states(state_embeddings)
-        cached_cross_kvs = [None] * len(ae.blocks)
+        cached_cross_kvs = None
+        all_visible = (
+            isinstance(encoder_attention_mask, torch.Tensor)
+            and encoder_attention_mask.dtype == torch.bool
+            and bool(torch.all(encoder_attention_mask))
+        )
         if states_mode == "self_attn":
             contexts = ae._prepare_context(encoder_hidden_states, None)
-            cross_mask = ae._build_cross_attention_mask(encoder_attention_mask, None, bsz, x.dtype)
+            cross_mask = None if all_visible else ae._build_cross_attention_mask(
+                encoder_attention_mask, None, bsz, x.dtype
+            )
         else:
             contexts = ae._prepare_context(encoder_hidden_states, encoded_states)
-            cross_mask = ae._build_cross_attention_mask(encoder_attention_mask, encoded_states, bsz, x.dtype)
+            cross_mask = None if all_visible else ae._build_cross_attention_mask(
+                encoder_attention_mask, encoded_states, bsz, x.dtype
+            )
 
     if states_mode == "self_attn" and encoded_states is not None:
         x = torch.cat([encoded_states, x], dim=1)
@@ -157,7 +261,13 @@ def _ae_forward(ae, actions, timesteps, encoder_hidden_states,
         pos = ae.action_pos_embed[:, :seq_len, :]
     x = x + pos
 
-    for block, context, cross_kv in zip(ae.blocks, contexts, cached_cross_kvs):
+    for i, block in enumerate(ae.blocks):
+        if cached_cross_kvs is not None:
+            cross_kv = (cached_cross_kvs[0, i], cached_cross_kvs[1, i])
+            context = None
+        else:
+            cross_kv = None
+            context = contexts[i]
         x = block(x, timestep_embed, context, attn_mask=cross_mask, cached_cross_kv=cross_kv)
 
     output = ae.final_layer(x, timestep_embed)
@@ -241,7 +351,7 @@ def _generate_actions_from_cache(model, layer_states, enc_mask, states,
             t = torch.full((batch_size,), i / steps, device=device)
             velocity = model.action_expert(
                 trajectory, t, layer_states, cached_context=cached_ctx)
-            trajectory = trajectory + dt * velocity
+            trajectory.add_(velocity, alpha=dt)
     return trajectory
 
 
@@ -254,7 +364,7 @@ def _enable_cuda_graph(model):
 
 def _run_flow_loop_cudagraph(model, trajectory, layer_states, cached_ctx, steps):
     batch_size = trajectory.shape[0]
-    ctx_seq_len = cached_ctx.cached_cross_kvs[0][0].shape[2]
+    ctx_seq_len = cached_ctx.cached_cross_kvs.shape[4]
     shape_key = (batch_size, steps, ctx_seq_len)
 
     if model._cuda_graph is None or model._graph_captured_shape != shape_key:
@@ -263,42 +373,93 @@ def _run_flow_loop_cudagraph(model, trajectory, layer_states, cached_ctx, steps)
 
     gv = model._graph_vars
     gv["trajectory"].copy_(trajectory)
-    for i, ctx in enumerate(cached_ctx.contexts):
-        gv["contexts"][i].copy_(ctx)
-    if cached_ctx.cross_mask is not None:
+    gv["cross_kvs"].copy_(cached_ctx.cached_cross_kvs)
+    if gv.get("cross_mask") is not None and cached_ctx.cross_mask is not None:
         gv["cross_mask"].copy_(cached_ctx.cross_mask)
-    for i, (k, v) in enumerate(cached_ctx.cached_cross_kvs):
-        gv["cross_kvs_k"][i].copy_(k)
-        gv["cross_kvs_v"][i].copy_(v)
-    if cached_ctx.encoded_states is not None:
+    if gv.get("encoded_states") is not None and cached_ctx.encoded_states is not None:
         gv["encoded_states"].copy_(cached_ctx.encoded_states)
 
     model._cuda_graph.replay()
-    return gv["trajectory"].clone()
+    return gv["trajectory"]
 
 
 @torch.no_grad()
 def _capture_flow_graph(model, trajectory, layer_states, cached_ctx, steps):
     device = trajectory.device
     batch_size = trajectory.shape[0]
+    if (
+        getattr(model, "_enable_compiled_ae_step", False)
+        and not getattr(model, "_compiled_ae_disabled", False)
+    ):
+        try:
+            g_traj = trajectory.clone()
+            g_kvs = cached_ctx.cached_cross_kvs.clone()
+            g_mask = cached_ctx.cross_mask.clone() if cached_ctx.cross_mask is not None else None
+            g_enc = cached_ctx.encoded_states.clone() if cached_ctx.encoded_states is not None else None
+            g_ts = [torch.full((batch_size,), i / steps, device=device) for i in range(steps)]
+            g_cached = ActionExpertCachedContext(
+                tuple(cached_ctx.contexts),
+                g_mask,
+                g_kvs,
+                g_enc,
+                cached_ctx.states_mode,
+            )
+            step_fn = _safe_compile_callable(
+                lambda traj, t: model.action_expert(
+                    traj, t, layer_states, cached_context=g_cached),
+                "action-expert-step",
+                mode="max-autotune-no-cudagraphs",
+                fullgraph=False,
+            )
+            dt = 1.0 / steps
+
+            for _ in range(2):
+                g_traj.copy_(trajectory)
+                for si in range(steps):
+                    vel = step_fn(g_traj, g_ts[si])
+                    g_traj.add_(vel, alpha=dt)
+            torch.cuda.synchronize()
+
+            graph = torch.cuda.CUDAGraph()
+            g_traj.copy_(trajectory)
+            with torch.cuda.graph(graph, pool=model._cuda_graph_pool):
+                for si in range(steps):
+                    vel = step_fn(g_traj, g_ts[si])
+                    g_traj.add_(vel, alpha=dt)
+
+            if model._cuda_graph_pool is None:
+                model._cuda_graph_pool = graph.pool()
+            model._cuda_graph = graph
+            model._graph_vars = {
+                "trajectory": g_traj,
+                "cross_mask": g_mask,
+                "cross_kvs": g_kvs,
+                "encoded_states": g_enc,
+            }
+            log.info(
+                "Captured compiled CUDA graph: steps=%d, ctx_len=%d",
+                steps, g_kvs.shape[4],
+            )
+            return
+        except Exception as exc:
+            log.warning("Compiled AE graph capture failed, falling back to eager path: %s", exc)
+            model._compiled_ae_disabled = True
 
     g_traj = trajectory.clone()
-    g_ctx = [c.clone() for c in cached_ctx.contexts]
+    g_ctx = list(cached_ctx.contexts)
     g_mask = cached_ctx.cross_mask.clone() if cached_ctx.cross_mask is not None else None
-    g_kvk = [k.clone() for k, v in cached_ctx.cached_cross_kvs]
-    g_kvv = [v.clone() for k, v in cached_ctx.cached_cross_kvs]
+    g_kvs = cached_ctx.cached_cross_kvs.clone()
     g_enc = cached_ctx.encoded_states.clone() if cached_ctx.encoded_states is not None else None
     g_ts = [torch.full((batch_size,), i / steps, device=device) for i in range(steps)]
-
     g_cached = ActionExpertCachedContext(
-        g_ctx, g_mask, list(zip(g_kvk, g_kvv)), g_enc, cached_ctx.states_mode)
-
+        g_ctx, g_mask, g_kvs, g_enc, cached_ctx.states_mode)
     dt = 1.0 / steps
-    for _ in range(2):  # warmup
+
+    for _ in range(2):
         g_traj.copy_(trajectory)
         for i in range(steps):
             vel = model.action_expert(g_traj, g_ts[i], layer_states, cached_context=g_cached)
-            g_traj.add_(dt * vel)
+            g_traj.add_(vel, alpha=dt)
     torch.cuda.synchronize()
 
     graph = torch.cuda.CUDAGraph()
@@ -306,16 +467,16 @@ def _capture_flow_graph(model, trajectory, layer_states, cached_ctx, steps):
     with torch.cuda.graph(graph, pool=model._cuda_graph_pool):
         for i in range(steps):
             vel = model.action_expert(g_traj, g_ts[i], layer_states, cached_context=g_cached)
-            g_traj.add_(dt * vel)
+            g_traj.add_(vel, alpha=dt)
 
     if model._cuda_graph_pool is None:
         model._cuda_graph_pool = graph.pool()
     model._cuda_graph = graph
     model._graph_vars = {
         "trajectory": g_traj, "contexts": g_ctx, "cross_mask": g_mask,
-        "cross_kvs_k": g_kvk, "cross_kvs_v": g_kvv, "encoded_states": g_enc,
+        "cross_kvs": g_kvs, "encoded_states": g_enc,
     }
-    log.info(f"Captured CUDA graph: steps={steps}, ctx_len={g_kvk[0].shape[2]}")
+    log.info(f"Captured eager CUDA graph: steps={steps}, ctx_len={g_kvs.shape[4]}")
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -334,6 +495,17 @@ def patch_flash_attention(model):
     vit = _patch_vit_fa2(model, flash_attn_func)
     ae = _patch_ae_fa2(model, flash_attn_func)
     log.info(f"FlashAttention-2: {llm} LLM + {vit} ViT + {ae} AE layers")
+
+
+def patch_action_expert_flash_attention(model):
+    """Wire flash_attn_func only into action-expert attention."""
+    try:
+        from flash_attn import flash_attn_func
+    except ImportError:
+        log.warning("flash_attn not installed, skipping AE FA2 patch")
+        return
+    ae = _patch_ae_fa2(model, flash_attn_func)
+    log.info("FlashAttention-2 AE-only: %d AE layers", ae)
 
 
 def _llm_flash_sdpa(q, k, v, attn_mask=None, drop_mask=None, dropout_p=0.0,
@@ -394,9 +566,21 @@ def _patch_ae_fa2(model, fa_func):
                     q = m.q_proj(x).view(bsz, tgt, m.num_heads, m.head_dim).to(torch.bfloat16)
                     if precomputed_kv is not None:
                         k, v = precomputed_kv
-                        o = _sdpa(q.transpose(1,2), k.to(torch.bfloat16), v.to(torch.bfloat16),
-                                  attn_mask=attn_mask, dropout_p=0.0)
-                        o = o.transpose(1,2)
+                        k = k.to(torch.bfloat16)
+                        v = v.to(torch.bfloat16)
+                        if attn_mask is None:
+                            # Cached K/V is already prepared per layer; use FA2 directly
+                            # in the common no-mask path to reduce flow-loop overhead.
+                            o = fa(q, k.transpose(1, 2), v.transpose(1, 2), dropout_p=0.0, causal=False)
+                        else:
+                            o = _sdpa(
+                                q.transpose(1, 2),
+                                k,
+                                v,
+                                attn_mask=attn_mask,
+                                dropout_p=0.0,
+                            )
+                            o = o.transpose(1, 2)
                     elif kv is None:
                         s = x.shape[1]
                         kv_out = m.kv_proj(x).view(bsz, s, 2, m.num_heads, m.head_dim).to(torch.bfloat16)
@@ -424,11 +608,17 @@ def _patch_ae_fa2(model, fa_func):
 
 def patch_compile_backbone(model):
     llm = 0
+    llm_skipped = 0
     for i, blk in enumerate(model.transformer.blocks):
-        model.transformer.blocks[i] = torch.compile(blk)
-        llm += 1
+        compiled = _safe_compile_module(blk, f"llm.block.{i}")
+        model.transformer.blocks[i] = compiled
+        if compiled is blk:
+            llm_skipped += 1
+        else:
+            llm += 1
 
     vit = 0
+    vit_skipped = 0
     vb = getattr(model, "vision_backbone", None)
     if vb:
         iv = getattr(vb, "image_vit", None)
@@ -438,14 +628,60 @@ def patch_compile_backbone(model):
                 rb = getattr(tr, "resblocks", None)
                 if rb:
                     for i, blk in enumerate(rb):
-                        rb[i] = torch.compile(blk)
-                        vit += 1
-    log.info(f"Compiled backbone: {llm} LLM + {vit} ViT blocks")
+                        compiled = _safe_compile_module(blk, f"vit.block.{i}")
+                        rb[i] = compiled
+                        if compiled is blk:
+                            vit_skipped += 1
+                        else:
+                            vit += 1
+    log.info(
+        "Compiled backbone: %d LLM + %d ViT blocks (skipped: %d LLM, %d ViT)",
+        llm,
+        vit,
+        llm_skipped,
+        vit_skipped,
+    )
 
 
 # ═══════════════════════════════════════════════════════════════════════════
 #  5. FP8 quantization (LOSSY — changes numerical precision)
 # ═══════════════════════════════════════════════════════════════════════════
+
+
+def _finalize_fp8_linear(mod):
+    """Freeze calibrated activation scale and install FP8 forward."""
+    e4m3_max = torch.finfo(torch.float8_e4m3fn).max
+
+    mod._calib_handle.remove()
+    del mod._calib_handle
+
+    act_amax = mod._calib_amax.clamp(min=1e-12)
+    act_scale = (e4m3_max / act_amax).float()
+    mod.act_scale = act_scale
+    mod.act_scale_inv = (1.0 / act_scale).float()
+    del mod._calib_amax
+
+    def fp8_forward(x, _m=mod, _e4=e4m3_max):
+        x_flat = x.reshape(-1, x.shape[-1])
+        x_fp8 = (x_flat.float() * _m.act_scale).clamp(-_e4, _e4).to(torch.float8_e4m3fn)
+        out = torch._scaled_mm(
+            x_fp8,
+            _m.weight_fp8.T,
+            scale_a=_m.act_scale_inv,
+            scale_b=_m.w_scale_inv,
+            out_dtype=torch.bfloat16,
+        )
+        if _m.bias is not None:
+            out = out + _m.bias
+        return out.view(*x.shape[:-1], out.shape[-1])
+
+    mod.forward = fp8_forward
+
+
+def _finalize_all_fp8(modules):
+    for mod in modules:
+        _finalize_fp8_linear(mod)
+
 
 def patch_fp8_quantize(model, *, quantize_backbone=True, quantize_action_expert=True):
     """Replace eligible Linear layers with FP8 static-weight, dynamic-activation matmuls.
@@ -487,35 +723,10 @@ def patch_fp8_quantize(model, *, quantize_backbone=True, quantize_action_expert=
             m._calib_amax = torch.max(m._calib_amax, amax)
         mod._calib_handle = mod.register_forward_hook(hook)
 
-    def _finalize_linear(mod):
-        """Freeze calibrated activation scale and install FP8 forward."""
-        mod._calib_handle.remove()
-        del mod._calib_handle
-
-        act_amax = mod._calib_amax.clamp(min=1e-12)
-        act_scale = (E4M3_MAX / act_amax).float()
-        mod.act_scale = act_scale
-        mod.act_scale_inv = (1.0 / act_scale).float()
-        del mod._calib_amax
-
-        def fp8_forward(x, _m=mod, _e4=E4M3_MAX):
-            x_flat = x.reshape(-1, x.shape[-1])
-            x_fp8 = (x_flat.float() * _m.act_scale).clamp(-_e4, _e4).to(torch.float8_e4m3fn)
-            out = torch._scaled_mm(
-                x_fp8, _m.weight_fp8.T,
-                scale_a=_m.act_scale_inv,
-                scale_b=_m.w_scale_inv,
-                out_dtype=torch.bfloat16,
-            )
-            if _m.bias is not None:
-                out = out + _m.bias
-            return out.view(*x.shape[:-1], out.shape[-1])
-        mod.forward = fp8_forward
-
     bb_count = ae_count = skipped = 0
 
     if quantize_backbone:
-        for fqn, mod in model.transformer.named_modules():
+        for _, mod in model.transformer.named_modules():
             if _fp8_eligible(mod):
                 _prepare_linear(mod)
                 _install_calib_hook(mod)
@@ -524,7 +735,7 @@ def patch_fp8_quantize(model, *, quantize_backbone=True, quantize_action_expert=
                 skipped += 1
 
     if quantize_action_expert:
-        for fqn, mod in model.action_expert.named_modules():
+        for _, mod in model.action_expert.named_modules():
             if _fp8_eligible(mod):
                 _prepare_linear(mod)
                 _install_calib_hook(mod)
@@ -536,37 +747,12 @@ def patch_fp8_quantize(model, *, quantize_backbone=True, quantize_action_expert=
              f"({skipped} skipped)... running calibration forward passes")
 
     model._fp8_eligible_mods = eligible_mods
-    model._fp8_finalize = lambda: _finalize_all(eligible_mods)
+    model._fp8_finalize = lambda: _finalize_all_fp8(eligible_mods)
 
 
 def _finalize_fp8(model):
     """Called after calibration forward passes to freeze FP8 scales."""
-    for mod in model._fp8_eligible_mods:
-        _mod = mod
-        E4M3_MAX = torch.finfo(torch.float8_e4m3fn).max
-
-        _mod._calib_handle.remove()
-        del _mod._calib_handle
-
-        act_amax = _mod._calib_amax.clamp(min=1e-12)
-        act_scale = (E4M3_MAX / act_amax).float()
-        _mod.act_scale = act_scale
-        _mod.act_scale_inv = (1.0 / act_scale).float()
-        del _mod._calib_amax
-
-        def fp8_forward(x, _m=_mod, _e4=E4M3_MAX):
-            x_flat = x.reshape(-1, x.shape[-1])
-            x_fp8 = (x_flat.float() * _m.act_scale).clamp(-_e4, _e4).to(torch.float8_e4m3fn)
-            out = torch._scaled_mm(
-                x_fp8, _m.weight_fp8.T,
-                scale_a=_m.act_scale_inv,
-                scale_b=_m.w_scale_inv,
-                out_dtype=torch.bfloat16,
-            )
-            if _m.bias is not None:
-                out = out + _m.bias
-            return out.view(*x.shape[:-1], out.shape[-1])
-        _mod.forward = fp8_forward
+    _finalize_all_fp8(model._fp8_eligible_mods)
 
     del model._fp8_eligible_mods
     del model._fp8_finalize
