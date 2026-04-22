@@ -566,9 +566,21 @@ def _patch_ae_fa2(model, fa_func):
                     q = m.q_proj(x).view(bsz, tgt, m.num_heads, m.head_dim).to(torch.bfloat16)
                     if precomputed_kv is not None:
                         k, v = precomputed_kv
-                        o = _sdpa(q.transpose(1,2), k.to(torch.bfloat16), v.to(torch.bfloat16),
-                                  attn_mask=attn_mask, dropout_p=0.0)
-                        o = o.transpose(1,2)
+                        k = k.to(torch.bfloat16)
+                        v = v.to(torch.bfloat16)
+                        if attn_mask is None:
+                            # Cached K/V is already prepared per layer; use FA2 directly
+                            # in the common no-mask path to reduce flow-loop overhead.
+                            o = fa(q, k.transpose(1, 2), v.transpose(1, 2), dropout_p=0.0, causal=False)
+                        else:
+                            o = _sdpa(
+                                q.transpose(1, 2),
+                                k,
+                                v,
+                                attn_mask=attn_mask,
+                                dropout_p=0.0,
+                            )
+                            o = o.transpose(1, 2)
                     elif kv is None:
                         s = x.shape[1]
                         kv_out = m.kv_proj(x).view(bsz, s, 2, m.num_heads, m.head_dim).to(torch.bfloat16)
