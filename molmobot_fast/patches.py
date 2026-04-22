@@ -528,19 +528,6 @@ def _patch_llm_fa2(model, fa_func):
     return count
 
 
-def patch_llm_flash_attention(model):
-    """Enable FlashAttention-2 only for LLM attention layers."""
-    try:
-        from flash_attn import flash_attn_func
-    except ImportError:
-        log.warning("flash_attn not installed, skipping LLM-only FA2 patch")
-        return 0
-    count = _patch_llm_fa2(model, flash_attn_func)
-    if count:
-        log.info("FlashAttention-2 (LLM-only): %d LLM layers", count)
-    return count
-
-
 def _patch_vit_fa2(model, fa_func):
     from olmo.nn.image_vit import ViTMultiHeadDotProductAttention
     count = 0
