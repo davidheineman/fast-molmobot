@@ -488,6 +488,17 @@ def patch_flash_attention(model):
     log.info(f"FlashAttention-2: {llm} LLM + {vit} ViT + {ae} AE layers")
 
 
+def patch_action_expert_flash_attention(model):
+    """Wire flash_attn_func only into action-expert attention."""
+    try:
+        from flash_attn import flash_attn_func
+    except ImportError:
+        log.warning("flash_attn not installed, skipping AE FA2 patch")
+        return
+    ae = _patch_ae_fa2(model, flash_attn_func)
+    log.info("FlashAttention-2 AE-only: %d AE layers", ae)
+
+
 def _llm_flash_sdpa(q, k, v, attn_mask=None, drop_mask=None, dropout_p=0.0,
                     is_causal=False, response_dropout_p=0.0):
     """Replacement for OLMoBlock._scaled_dot_product_attention that always uses FA2 causal."""
