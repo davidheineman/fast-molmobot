@@ -124,7 +124,9 @@ class FastMolmoBot:
     def _apply_patches(self, cuda_graph, flash_attn, compile_bb, async_preprocess, fp8, tensorrt):
         patch_action_expert(self._model)
         patch_molmobot(self._model)
-        self._model._enable_compiled_ae_step = False
+        self._model._enable_compiled_ae_step = bool(
+            compile_bb and async_preprocess and cuda_graph
+        )
         # In this stack, FA2 tends to regress latency once compile_backbone is on.
         use_flash = flash_attn and not compile_bb
         if use_flash:

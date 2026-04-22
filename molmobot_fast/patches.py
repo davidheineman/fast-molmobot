@@ -304,45 +304,6 @@ def _enable_cuda_graph(model):
     model._graph_captured_shape = None
 
 
-def _build_compiled_ae_step(ae):
-    """Build a torch.compile'd AE step with fused norm+modulate+attn+MLP."""
-    blocks = ae.blocks
-    final = ae.final_layer
-    w, b, pos = ae.action_embed.weight, ae.action_embed.bias, ae.action_pos_embed
-
-    def step(traj, asl, kvk, kvv, mask, te):
-        x = F.linear(traj, w, b) + pos[:, :16, :]
-        for bi in range(len(blocks)):
-            bk = blocks[bi]; i9 = bi * 9
-            s0, s1, s2 = asl[i9], asl[i9+1], asl[i9+2]
-            s3, s4, s5 = asl[i9+3], asl[i9+4], asl[i9+5]
-            s6, s7, s8 = asl[i9+6], asl[i9+7], asl[i9+8]
-            n = bk.norm1(x) * (1 + s1.unsqueeze(1)) + s0.unsqueeze(1)
-            bsz, tgt, _ = n.shape
-            q = bk.attn1.q_proj(n).view(bsz, tgt, bk.attn1.num_heads, bk.attn1.head_dim).transpose(1, 2)
-            kv = bk.attn1.kv_proj(n).view(bsz, tgt, 2, bk.attn1.num_heads, bk.attn1.head_dim).permute(2, 0, 3, 1, 4)
-            sa = F.scaled_dot_product_attention(q, kv[0], kv[1], dropout_p=0.0)
-            x = x + s2.unsqueeze(1) * bk.attn1.proj(
-                sa.transpose(1, 2).contiguous().view(bsz, tgt, bk.attn1.hidden_size))
-            n2 = bk.norm2(x) * (1 + s4.unsqueeze(1)) + s3.unsqueeze(1)
-            q2 = bk.attn2.q_proj(n2).view(bsz, tgt, bk.attn2.num_heads, bk.attn2.head_dim).transpose(1, 2)
-            ca = F.scaled_dot_product_attention(q2, kvk[bi], kvv[bi], attn_mask=mask, dropout_p=0.0)
-            x = x + s5.unsqueeze(1) * bk.attn2.proj(
-                ca.transpose(1, 2).contiguous().view(bsz, tgt, bk.attn2.hidden_size))
-            n3 = bk.norm3(x) * (1 + s7.unsqueeze(1)) + s6.unsqueeze(1)
-            x = x + s8.unsqueeze(1) * F.linear(
-                F.gelu(F.linear(n3, bk.mlp.fc1.weight, bk.mlp.fc1.bias)),
-                bk.mlp.fc2.weight, bk.mlp.fc2.bias)
-        return final(x, te)
-
-    return _safe_compile_callable(
-        step,
-        "action-expert-step",
-        mode="max-autotune-no-cudagraphs",
-        fullgraph=False,
-    )
-
-
 def _run_flow_loop_cudagraph(model, trajectory, layer_states, cached_ctx, steps):
     batch_size = trajectory.shape[0]
     ctx_seq_len = cached_ctx.cached_cross_kvs[0][0].shape[2]
@@ -369,35 +330,38 @@ def _run_flow_loop_cudagraph(model, trajectory, layer_states, cached_ctx, steps)
 @torch.no_grad()
 def _capture_flow_graph(model, trajectory, layer_states, cached_ctx, steps):
     device = trajectory.device
+    batch_size = trajectory.shape[0]
     if (
         getattr(model, "_enable_compiled_ae_step", False)
         and not getattr(model, "_compiled_ae_disabled", False)
     ):
         try:
-            if getattr(model, "_compiled_ae_step", None) is None:
-                log.info("Compiling AE step (first-use autotune)...")
-                torch._dynamo.reset()
-                model._compiled_ae_step = _build_compiled_ae_step(model.action_expert)
-
-            compiled_step = model._compiled_ae_step
-            ts = torch.arange(steps, device=device, dtype=torch.float32) / steps
-            t_embeds = model.action_expert.time_embed(ts)
-            adaln_flat = []
-            for blk in model.action_expert.blocks:
-                adaln_flat.extend(blk.adaLN_modulation(t_embeds).chunk(9, dim=1))
-
             g_traj = trajectory.clone()
             g_kvk = [k.clone() for k, _ in cached_ctx.cached_cross_kvs]
             g_kvv = [v.clone() for _, v in cached_ctx.cached_cross_kvs]
             g_mask = cached_ctx.cross_mask.clone() if cached_ctx.cross_mask is not None else None
-            g_adaln = [[m[si:si + 1].clone() for m in adaln_flat] for si in range(steps)]
-            g_te = [t_embeds[i:i + 1].clone() for i in range(steps)]
+            g_enc = cached_ctx.encoded_states.clone() if cached_ctx.encoded_states is not None else None
+            g_ts = [torch.full((batch_size,), i / steps, device=device) for i in range(steps)]
+            g_cached = ActionExpertCachedContext(
+                tuple(cached_ctx.contexts),
+                g_mask,
+                list(zip(g_kvk, g_kvv)),
+                g_enc,
+                cached_ctx.states_mode,
+            )
+            step_fn = _safe_compile_callable(
+                lambda traj, t: model.action_expert(
+                    traj, t, layer_states, cached_context=g_cached),
+                "action-expert-step",
+                mode="max-autotune-no-cudagraphs",
+                fullgraph=False,
+            )
             dt = 1.0 / steps
 
             for _ in range(2):
                 g_traj.copy_(trajectory)
                 for si in range(steps):
-                    vel = compiled_step(g_traj, g_adaln[si], g_kvk, g_kvv, g_mask, g_te[si])
+                    vel = step_fn(g_traj, g_ts[si])
                     g_traj.add_(vel, alpha=dt)
             torch.cuda.synchronize()
 
@@ -405,7 +369,7 @@ def _capture_flow_graph(model, trajectory, layer_states, cached_ctx, steps):
             g_traj.copy_(trajectory)
             with torch.cuda.graph(graph, pool=model._cuda_graph_pool):
                 for si in range(steps):
-                    vel = compiled_step(g_traj, g_adaln[si], g_kvk, g_kvv, g_mask, g_te[si])
+                    vel = step_fn(g_traj, g_ts[si])
                     g_traj.add_(vel, alpha=dt)
 
             if model._cuda_graph_pool is None:
@@ -416,15 +380,17 @@ def _capture_flow_graph(model, trajectory, layer_states, cached_ctx, steps):
                 "cross_mask": g_mask,
                 "cross_kvs_k": g_kvk,
                 "cross_kvs_v": g_kvv,
+                "encoded_states": g_enc,
             }
-            log.info(f"Captured compiled CUDA graph: steps={steps}, ctx_len={g_kvk[0].shape[2]}")
+            log.info(
+                "Captured compiled CUDA graph: steps=%d, ctx_len=%d",
+                steps, g_kvk[0].shape[2],
+            )
             return
         except Exception as exc:
             log.warning("Compiled AE graph capture failed, falling back to eager path: %s", exc)
             model._compiled_ae_disabled = True
-            model._compiled_ae_step = None
 
-    batch_size = trajectory.shape[0]
     g_traj = trajectory.clone()
     g_ctx = list(cached_ctx.contexts)
     g_mask = cached_ctx.cross_mask.clone() if cached_ctx.cross_mask is not None else None
