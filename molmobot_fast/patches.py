@@ -1,4 +1,5 @@
 import hashlib
+import importlib.util
 import logging
 from dataclasses import dataclass
 from typing import Optional, Sequence, Tuple
@@ -7,6 +8,51 @@ import torch
 import torch.nn.functional as F
 
 log = logging.getLogger(__name__)
+
+
+def _compile_supported() -> bool:
+    # Some nightly/staged torch wheels miss this module needed by torch.compile.
+    return (
+        hasattr(torch, "compile")
+        and importlib.util.find_spec("torch._subclasses.schema_check_mode") is not None
+    )
+
+
+_CAN_COMPILE = _compile_supported()
+
+
+def _safe_compile_callable(fn, label: str, **compile_kwargs):
+    if not _CAN_COMPILE:
+        return fn
+    try:
+        compiled = torch.compile(fn, **compile_kwargs)
+    except Exception as exc:
+        log.warning("torch.compile unavailable for %s: %s", label, exc)
+        return fn
+
+    failed = {"value": False}
+
+    def wrapped(*args, **kwargs):
+        if failed["value"]:
+            return fn(*args, **kwargs)
+        try:
+            return compiled(*args, **kwargs)
+        except Exception as exc:
+            failed["value"] = True
+            log.warning("Falling back to eager %s after compile failure: %s", label, exc)
+            return fn(*args, **kwargs)
+
+    return wrapped
+
+
+def _safe_compile_module(module, label: str, **compile_kwargs):
+    if not _CAN_COMPILE:
+        return module
+    try:
+        return torch.compile(module, **compile_kwargs)
+    except Exception as exc:
+        log.warning("torch.compile unavailable for %s: %s", label, exc)
+        return module
 
 # ═══════════════════════════════════════════════════════════════════════════
 #  Cached-context dataclass (used by the action expert KV cache)
@@ -24,9 +70,11 @@ class ActionExpertCachedContext:
 #  1. Action Expert patches — SDPA, precomputed KV, context caching
 # ═══════════════════════════════════════════════════════════════════════════
 
-@torch.compile
-def _compiled_modulate(x, shift, scale):
+def _modulate(x, shift, scale):
     return x * (1 + scale.unsqueeze(1)) + shift.unsqueeze(1)
+
+
+_compiled_modulate = _safe_compile_callable(_modulate, "_modulate")
 
 
 def patch_action_expert(model):
@@ -45,7 +93,7 @@ def patch_action_expert(model):
     from olmo.nn.action_expert import ActionExpertBlock, ActionExpertMLP
     for mod in model.modules():
         if isinstance(mod, ActionExpertMLP):
-            mod.forward = torch.compile(mod.forward)
+            mod.forward = _safe_compile_callable(mod.forward, f"{type(mod).__name__}.forward")
 
     for mod in model.modules():
         if isinstance(mod, ActionExpertBlock):
@@ -241,7 +289,7 @@ def _generate_actions_from_cache(model, layer_states, enc_mask, states,
             t = torch.full((batch_size,), i / steps, device=device)
             velocity = model.action_expert(
                 trajectory, t, layer_states, cached_context=cached_ctx)
-            trajectory = trajectory + dt * velocity
+            trajectory.add_(velocity, alpha=dt)
     return trajectory
 
 
@@ -298,7 +346,7 @@ def _capture_flow_graph(model, trajectory, layer_states, cached_ctx, steps):
         g_traj.copy_(trajectory)
         for i in range(steps):
             vel = model.action_expert(g_traj, g_ts[i], layer_states, cached_context=g_cached)
-            g_traj.add_(dt * vel)
+            g_traj.add_(vel, alpha=dt)
     torch.cuda.synchronize()
 
     graph = torch.cuda.CUDAGraph()
@@ -306,7 +354,7 @@ def _capture_flow_graph(model, trajectory, layer_states, cached_ctx, steps):
     with torch.cuda.graph(graph, pool=model._cuda_graph_pool):
         for i in range(steps):
             vel = model.action_expert(g_traj, g_ts[i], layer_states, cached_context=g_cached)
-            g_traj.add_(dt * vel)
+            g_traj.add_(vel, alpha=dt)
 
     if model._cuda_graph_pool is None:
         model._cuda_graph_pool = graph.pool()
@@ -424,11 +472,17 @@ def _patch_ae_fa2(model, fa_func):
 
 def patch_compile_backbone(model):
     llm = 0
+    llm_skipped = 0
     for i, blk in enumerate(model.transformer.blocks):
-        model.transformer.blocks[i] = torch.compile(blk)
-        llm += 1
+        compiled = _safe_compile_module(blk, f"llm.block.{i}")
+        model.transformer.blocks[i] = compiled
+        if compiled is blk:
+            llm_skipped += 1
+        else:
+            llm += 1
 
     vit = 0
+    vit_skipped = 0
     vb = getattr(model, "vision_backbone", None)
     if vb:
         iv = getattr(vb, "image_vit", None)
@@ -438,9 +492,19 @@ def patch_compile_backbone(model):
                 rb = getattr(tr, "resblocks", None)
                 if rb:
                     for i, blk in enumerate(rb):
-                        rb[i] = torch.compile(blk)
-                        vit += 1
-    log.info(f"Compiled backbone: {llm} LLM + {vit} ViT blocks")
+                        compiled = _safe_compile_module(blk, f"vit.block.{i}")
+                        rb[i] = compiled
+                        if compiled is blk:
+                            vit_skipped += 1
+                        else:
+                            vit += 1
+    log.info(
+        "Compiled backbone: %d LLM + %d ViT blocks (skipped: %d LLM, %d ViT)",
+        llm,
+        vit,
+        llm_skipped,
+        vit_skipped,
+    )
 
 
 # ═══════════════════════════════════════════════════════════════════════════

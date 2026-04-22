@@ -288,7 +288,7 @@ class FastMolmoBot:
         return out[0]
 
     def _run_cached(self, mi):
-        key = hash_inputs(mi["input_ids"], mi.get("images"))
+        key = hash_inputs(mi["input_ids"], None)
         if key == self._backbone_cache_key and self._cached_layer_states is not None:
             self._backbone_cache_hits += 1
             ls, em = self._cached_layer_states, self._cached_encoder_attn_mask
