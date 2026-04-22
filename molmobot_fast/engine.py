@@ -8,6 +8,7 @@ import torch
 
 from molmobot_fast.patches import (
     ActionExpertCachedContext,
+    _patch_llm_fa2,
     _patch_ae_fa2,
     _finalize_fp8,
     hash_inputs,
@@ -137,8 +138,13 @@ class FastMolmoBot:
             # for action expert attention where flow-loop latency dominates.
             try:
                 from flash_attn import flash_attn_func
+                llm_layers = _patch_llm_fa2(self._model, flash_attn_func)
                 ae_layers = _patch_ae_fa2(self._model, flash_attn_func)
-                log.info("FlashAttention-2 (AE-only): %d AE layers", ae_layers)
+                log.info(
+                    "FlashAttention-2 (LLM+AE): %d LLM + %d AE layers",
+                    llm_layers,
+                    ae_layers,
+                )
             except ImportError:
                 pass
         if fp8:
