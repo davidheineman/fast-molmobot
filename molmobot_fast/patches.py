@@ -168,6 +168,16 @@ def _stack_cross_kvs(cached_cross_kvs: Sequence[Tuple[torch.Tensor, torch.Tensor
     return torch.stack((ks, vs), dim=0).contiguous()
 
 
+def _project_context_layers(ae, encoder_hidden_states: Sequence[torch.Tensor]) -> Sequence[torch.Tensor]:
+    if not encoder_hidden_states:
+        return []
+    batch_size = encoder_hidden_states[0].shape[0]
+    # Fuse context projection + norm across all selected backbone layers to cut launch overhead.
+    stacked = torch.cat(tuple(encoder_hidden_states), dim=0)
+    projected = ae.context_norm(ae.context_proj(stacked))
+    return projected.split(batch_size, dim=0)
+
+
 def _ae_precompute_context(ae, encoder_hidden_states, encoder_attention_mask=None,
                            state_embeddings=None, states_mode="cross_attn"):
     bsz = encoder_hidden_states[0].shape[0]
@@ -179,20 +189,19 @@ def _ae_precompute_context(ae, encoder_hidden_states, encoder_attention_mask=Non
         and bool(torch.all(encoder_attention_mask))
     )
     cached_cross_kvs = []
+    projected_contexts = _project_context_layers(ae, encoder_hidden_states)
     if states_mode == "self_attn":
         cross_mask = None if all_visible else ae._build_cross_attention_mask(
             encoder_attention_mask, None, bsz, ctx_dtype
         )
-        for blk, hidden in zip(ae.blocks, encoder_hidden_states):
-            ctx = ae.context_norm(ae.context_proj(hidden))
+        for blk, ctx in zip(ae.blocks, projected_contexts):
             cached_cross_kvs.append(blk.precompute_cross_kv(ctx))
         cached_encoded_states = encoded_states
     else:
         cross_mask = None if all_visible else ae._build_cross_attention_mask(
             encoder_attention_mask, encoded_states, bsz, ctx_dtype
         )
-        for blk, hidden in zip(ae.blocks, encoder_hidden_states):
-            ctx = ae.context_norm(ae.context_proj(hidden))
+        for blk, ctx in zip(ae.blocks, projected_contexts):
             if encoded_states is not None:
                 ctx = torch.cat([ctx, encoded_states], dim=1)
             cached_cross_kvs.append(blk.precompute_cross_kv(ctx))
